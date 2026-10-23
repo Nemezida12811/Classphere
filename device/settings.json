@@ -1,0 +1,1 @@
+{"units": "standard", "ntp_host": "pool.ntp.org", "room": "", "user": {"login": "Boss", "password": "4444"}, "mqtt": {"server": "", "user": "", "port": 8883, "cert": "", "password": "", "ssl": true}, "id": "", "measurement_interval": 10000, "wifi": {"ssid": "", "password": ""}, "department": ""}
