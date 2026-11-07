@@ -1,0 +1,1566 @@
+diff --git a/backend/.env.example b/backend/.env.example
+index 7b32d4b..24a4bbb 100644
+--- a/backend/.env.example
++++ b/backend/.env.example
+@@ -14,3 +14,16 @@ DATABASE_URL=sqlite:///./school_env.db
+ 
+ # For PostgreSQL (Docker):
+ # DATABASE_URL=postgresql://school_user:school_pass@db:5432/school_db
++
++# MQTT (leave empty to disable; the backend still works via REST and the simulator)
++MQTT_URL=
++# MQTT_URL=mqtt://localhost:1883
++
++# Run WITHOUT a physical device: built-in simulator writes fake telemetry
++SIMULATE_DEVICES=true
++SIMULATE_DEVICE_IDS=sim-room-1,sim-room-2,sim-room-3
++SIMULATE_INTERVAL_SEC=5
++
++# Optional AI recommendations (without a key a rule-based fallback is used)
++OPENAI_API_KEY=
++OPENAI_MODEL=gpt-4o-mini
+diff --git a/backend/README.md b/backend/README.md
+index af486ab..bc10fb8 100644
+--- a/backend/README.md
++++ b/backend/README.md
+@@ -43,6 +43,13 @@
+ 
+ ---
+ 
++## Запуск без пристрою (симулятор)
++У `.env` встановіть `SIMULATE_DEVICES=true` — backend сам генерує телеметрію для `sim-room-1..3`.
++Дивіться `GET /api/comfort/sim-room-1/sensors`, `/api/comfort/sim-room-1`, `/api/comfort/sim-room-1/recommendations`.
++Деталі та запуск через MQTT: `testbench/README.md`.
++
++---
++
+ ## Запуск через Docker Compose
+ 
+ ```bash
+diff --git a/backend/app/comfort.py b/backend/app/comfort.py
+index 5905715..96ddeac 100644
+--- a/backend/app/comfort.py
++++ b/backend/app/comfort.py
+@@ -81,10 +81,37 @@ async def calculate_comfort_by_audience(audience_id: str) -> dict | None:
+     }
+ 
+ 
++def rule_based_tips(latest: dict) -> list:
++    """Offline fallback (no OPENAI_API_KEY): simple tips from the ideal ranges."""
++    advice = {
++        "temperature": ("Open a window or lower the heating", "Open a window or raise the heating"),
++        "humidity": ("Ventilate the room or use a dehumidifier", "Use a humidifier or ventilate"),
++        "gas": ("Ventilate the room - CO2 is high", "Air quality is fine"),
++        "light": ("Reduce glare or dim the lights", "Turn on more lighting"),
++        "sound": ("Reduce noise levels", "Noise is fine"),
++    }
++    tips = []
++    for field, (lo, hi), threshold in _METRICS:
++        val = latest[field]
++        if lo <= val <= hi:
++            continue
++        deviation = (lo - val) if val < lo else (val - hi)
++        ratio = deviation / threshold
++        tips.append({
++            "priority": "high" if ratio > 0.6 else "medium" if ratio > 0.3 else "low",
++            "type": field,
++            "message": advice[field][1 if val < lo else 0],
++            "reason": f"{field} is {val} (ideal {lo}-{hi})",
++        })
++    return tips[:3]
++
++
+ async def generate_tips(audience_id: str) -> list | None:
+     latest = await SensorReadings.find_latest(audience_id)
+     if not latest:
+         return None
++    if not settings.openai_api_key:
++        return rule_based_tips(latest)
+ 
+     u = latest.get("units") or {}
+     prompt = f"""You are an indoor comfort inspector. You have the following sensor data:
+diff --git a/backend/app/config.py b/backend/app/config.py
+index 598c19b..ef28dba 100644
+--- a/backend/app/config.py
++++ b/backend/app/config.py
+@@ -15,6 +15,19 @@ class Settings(BaseSettings):
+     # Database: SQLite by default for easy local dev; Postgres in prod/docker
+     DATABASE_URL: str = os.getenv("DATABASE_URL", "sqlite:///./school_env.db")
+ 
++    # MQTT (empty -> MQTT is disabled; the backend then works with REST + simulator only)
++    mqtt_url: str = ""
++    mqtt_client_id: str = "smart-school-backend"
++
++    # Built-in device simulator: lets you run the whole project without a physical device
++    simulate_devices: bool = False
++    simulate_device_ids: str = "sim-room-1,sim-room-2,sim-room-3"
++    simulate_interval_sec: float = 5.0
++
++    # AI recommendations (optional; without a key a simple rule-based fallback is used)
++    openai_api_key: str = ""
++    openai_model: str = "gpt-4o-mini"
++
+     model_config = SettingsConfigDict(
+         env_file=".env",
+         env_file_encoding="utf-8",
+diff --git a/backend/app/db.py b/backend/app/db.py
+index eb182de..6705e9e 100644
+--- a/backend/app/db.py
++++ b/backend/app/db.py
+@@ -1,6 +1,6 @@
+ from datetime import datetime
+ from typing import Generator
+-from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime, Text
++from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime, Text, Float, JSON, Index
+ from sqlalchemy.orm import declarative_base, sessionmaker, Session
+ from app.config import settings
+ 
+@@ -43,6 +43,23 @@ class Location(Base):
+     created_at = Column(DateTime, default=datetime.utcnow)
+ 
+ 
++class SensorReading(Base):
++    """One telemetry measurement from a device (real or simulated)."""
++    __tablename__ = "sensor_readings"
++
++    id = Column(Integer, primary_key=True, index=True)
++    device_id = Column(String(100), nullable=False, index=True)
++    timestamp = Column(DateTime, nullable=False)  # stored as naive UTC
++    temperature = Column(Float, nullable=False)
++    humidity = Column(Float, nullable=False)
++    gas = Column(Float, nullable=False)
++    light = Column(Float, nullable=False)
++    sound = Column(Float, nullable=False)
++    units = Column(JSON, nullable=True)
++
++    __table_args__ = (Index("ix_sensor_readings_device_ts", "device_id", "timestamp"),)
++
++
+ def get_db() -> Generator[Session, None, None]:
+     """FastAPI Dependency for database session management."""
+     db = SessionLocal()
+diff --git a/backend/app/errors.py b/backend/app/errors.py
+index a47a233..85e4ab3 100644
+--- a/backend/app/errors.py
++++ b/backend/app/errors.py
+@@ -1,5 +1,11 @@
++import logging
++from contextlib import contextmanager
++from datetime import datetime, timezone
++
+ from fastapi import HTTPException, status
+ 
++log = logging.getLogger("api")
++
+ 
+ class EntityNotFoundException(HTTPException):
+     def __init__(self, detail: str = "Resource not found"):
+@@ -23,3 +29,33 @@ class UnauthorizedException(HTTPException):
+ class ForbiddenException(HTTPException):
+     def __init__(self, detail: str = "Permission denied"):
+         super().__init__(status_code=status.HTTP_403_FORBIDDEN, detail=detail)
++
++
++class ApiError(HTTPException):
++    def __init__(self, status_code: int, message: str):
++        super().__init__(status_code=status_code, detail=message)
++
++
++def ok(data):
++    """Standard success envelope used by the sensor/comfort endpoints."""
++    return {"success": True, "data": data}
++
++
++def iso(dt: datetime) -> str:
++    """datetime -> 'YYYY-MM-DDTHH:MM:SS.mmmZ' (naive datetimes are treated as UTC)."""
++    if dt.tzinfo is None:
++        dt = dt.replace(tzinfo=timezone.utc)
++    dt = dt.astimezone(timezone.utc)
++    return dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{dt.microsecond // 1000:03d}Z"
++
++
++@contextmanager
++def failing_as(message: str, with_details: bool = False):
++    """Let HTTP errors through; turn any other exception into a 500 with `message`."""
++    try:
++        yield
++    except HTTPException:
++        raise
++    except Exception as exc:
++        log.exception("%s", message)
++        raise ApiError(500, f"{message}: {exc}" if with_details else message)
+diff --git a/backend/app/main.py b/backend/app/main.py
+index 34cec50..71a85c2 100644
+--- a/backend/app/main.py
++++ b/backend/app/main.py
+@@ -1,3 +1,5 @@
++import asyncio
++import logging
+ from contextlib import asynccontextmanager
+ from fastapi import FastAPI
+ from fastapi.middleware.cors import CORSMiddleware
+@@ -6,14 +8,25 @@ from app.config import settings
+ from app.db import init_db
+ from app.routers.auth import router as auth_router
+ from app.routers.locations import router as locations_router
++from app.routers.comfort import router as comfort_router
++from app import simulator
++from app.mqtt_client import mqtt_client
++from app.telemetry import handle_message
++
++logging.basicConfig(level=logging.INFO)
+ 
+ 
+ @asynccontextmanager
+ async def lifespan(app: FastAPI):
+     # Startup: ensure tables exist
+     init_db()
++    # MQTT is optional: without MQTT_URL the backend runs with REST (+ simulator) only
++    mqtt_client.initialize(asyncio.get_running_loop(), handle_message)
++    sim_task = simulator.start()  # no-op unless SIMULATE_DEVICES=true
+     yield
+-    # Shutdown logic (if any)
++    if sim_task:
++        sim_task.cancel()
++    mqtt_client.close()
+ 
+ 
+ app = FastAPI(
+@@ -37,6 +50,7 @@ app.add_middleware(
+ # Register routers
+ app.include_router(auth_router, prefix=settings.API_V1_PREFIX)
+ app.include_router(locations_router, prefix=settings.API_V1_PREFIX)
++app.include_router(comfort_router)  # /api/comfort/...
+ 
+ 
+ @app.get("/health", tags=["Health"])
+diff --git a/backend/app/repositories.py b/backend/app/repositories.py
+index 4cb1576..1465fea 100644
+--- a/backend/app/repositories.py
++++ b/backend/app/repositories.py
+@@ -1,6 +1,9 @@
++import asyncio
++from datetime import timezone
+ from typing import List, Optional
+ from sqlalchemy.orm import Session
+-from app.db import User, Location
++from app import db as _db
++from app.db import User, Location, SensorReading
+ from app.schemas import UserCreate, LocationCreate, LocationUpdate
+ from app.security import get_password_hash
+ 
+@@ -83,3 +86,45 @@ class LocationRepository:
+         self.db.delete(db_location)
+         self.db.commit()
+         return True
++
++
++class SensorReadings:
++    """Telemetry storage on SQLAlchemy. Async API (DB work runs in a worker thread)."""
++
++    @staticmethod
++    def _save(device_id: str, t: dict) -> None:
++        ts = t["timestamp"]
++        if ts.tzinfo is not None:
++            ts = ts.astimezone(timezone.utc).replace(tzinfo=None)
++        with _db.SessionLocal() as session:
++            session.add(SensorReading(
++                device_id=device_id, timestamp=ts,
++                temperature=t["temperature"], humidity=t["humidity"],
++                gas=t["gas"], light=t["light"], sound=t["sound"],
++                units=t.get("units"),
++            ))
++            session.commit()
++
++    @staticmethod
++    def _find_latest(device_id: str) -> Optional[dict]:
++        with _db.SessionLocal() as session:
++            r = (session.query(SensorReading)
++                 .filter(SensorReading.device_id == device_id)
++                 .order_by(SensorReading.timestamp.desc(), SensorReading.id.desc())
++                 .first())
++            if not r:
++                return None
++            return {
++                "device_id": r.device_id, "timestamp": r.timestamp,
++                "temperature": r.temperature, "humidity": r.humidity,
++                "gas": r.gas, "light": r.light, "sound": r.sound,
++                "units": r.units or {},
++            }
++
++    @staticmethod
++    async def save(device_id: str, telemetry: dict) -> None:
++        await asyncio.to_thread(SensorReadings._save, device_id, telemetry)
++
++    @staticmethod
++    async def find_latest(device_id: str) -> Optional[dict]:
++        return await asyncio.to_thread(SensorReadings._find_latest, device_id)
+diff --git a/backend/app/simulator.py b/backend/app/simulator.py
+new file mode 100644
+index 0000000..f66f9bf
+--- /dev/null
++++ b/backend/app/simulator.py
+@@ -0,0 +1,74 @@
++"""Built-in device simulator.
++
++Lets you run the whole backend without a physical device and without an MQTT broker.
++Fake devices produce payloads in the same format as the firmware (raw 16-bit ADC values
++for gas/sound/light, ISO timestamp) and feed them into the normal telemetry pipeline
++(`telemetry.handle_message`), so parsing, unit conversion, DB storage and the comfort
++endpoints are exercised exactly as with real MQTT data.
++
++Enable with SIMULATE_DEVICES=true (see .env.example).
++"""
++import asyncio
++import json
++import logging
++import math
++import random
++from datetime import datetime, timezone
++
++from .config import settings
++from .telemetry import handle_message
++
++log = logging.getLogger("simulator")
++
++# scenario -> (temperature C, humidity %, CO2 ppm, light lx, noise dB)
++_SCENARIOS = {
++    "comfortable": (22.0, 45.0, 600.0, 500.0, 35.0),
++    "stuffy": (26.5, 65.0, 1600.0, 250.0, 55.0),
++    "school-day": (21.0, 40.0, 900.0, 600.0, 45.0),
++}
++
++
++def _raw(value: float, lo: float, hi: float) -> int:
++    """Inverse of telemetry.convert_units: physical value -> raw 16-bit ADC value."""
++    return int(max(0.0, min(1.0, (value - lo) / (hi - lo))) * 65535)
++
++
++def make_payload(scenario: str, t: float, rng: random.Random) -> dict:
++    temp, hum, co2, lux, db = _SCENARIOS[scenario]
++    if scenario == "school-day":  # CO2 rises during a "lesson" and drops at the "break" (saw-tooth)
++        co2 += 700 * math.sin(math.pi * ((t / 60.0) % 1.0))
++    now = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
++    return {
++        "timestamp": now,
++        "sensors": {
++            "temperature": {"value": round(temp + rng.uniform(-0.5, 0.5), 1), "units": "C"},
++            "humidity": {"value": round(hum + rng.uniform(-3, 3), 1), "units": "%"},
++            "gas": {"value": _raw(co2 + rng.uniform(-50, 50), 200, 10000), "units": "ppm"},
++            "light": {"value": _raw(lux + rng.uniform(-40, 40), 0.1, 100000), "units": "lx"},
++            "sound": {"value": _raw(db + rng.uniform(-3, 3), 40, 120), "units": "dB"},
++        },
++    }
++
++
++async def _run(device_ids: list[str], interval: float) -> None:
++    rng = random.Random(42)
++    scenarios = list(_SCENARIOS)
++    assigned = {d: scenarios[i % len(scenarios)] for i, d in enumerate(device_ids)}
++    log.info("🤖 Simulator started: %s every %.1fs", assigned, interval)
++    t = 0.0
++    while True:
++        for device_id, scenario in assigned.items():
++            payload = make_payload(scenario, t, rng)
++            await handle_message(f"iot/device/{device_id}/telemetry", json.dumps(payload).encode())
++        await asyncio.sleep(interval)
++        t += interval
++
++
++def start() -> asyncio.Task | None:
++    """Start the simulator as a background task (call from a running event loop)."""
++    if not settings.simulate_devices:
++        return None
++    ids = [d.strip() for d in settings.simulate_device_ids.split(",") if d.strip()]
++    if not ids:
++        return None
++    return asyncio.create_task(_run(ids, max(0.5, settings.simulate_interval_sec)))
+diff --git a/backend/requirements.txt b/backend/requirements.txt
+index 704d6a1..a7ec16f 100644
+--- a/backend/requirements.txt
++++ b/backend/requirements.txt
+@@ -8,4 +8,6 @@ passlib[bcrypt]>=1.7.4
+ bcrypt==4.0.1
+ email-validator>=2.0.0
+ python-multipart>=0.0.9
+-psycopg2-binary>=2.9.9
+\ No newline at end of file
++psycopg2-binary>=2.9.9
++paho-mqtt>=2.1
++openai>=1.40.0
+diff --git a/backend/testbench/README.md b/backend/testbench/README.md
+index b123595..c43db86 100644
+--- a/backend/testbench/README.md
++++ b/backend/testbench/README.md
+@@ -1,66 +1,37 @@
+-# Тестовий стенд: емулятор пристрою + наскрізна перевірка
++# Тестовий стенд: запуск без реального пристрою (SQLite, без MongoDB)
+ 
+-Що тут є
+-- `device_simulator.py` — емулятор Inspector-comforT (Pico W), поводиться як прошивка з `device/app_a`.
+-- `e2e_check.py` — автоматична перевірка ланцюга **пристрій → MQTT → backend → MongoDB → REST** (~50 перевірок).
+-- `run_backend_inmemory.py` — запуск backend **без MongoDB** (дані в памʼяті).
+-- `docker-compose.dev.yml` — MongoDB + Mosquitto + backend в Docker (не запускався в моєму середовищі).
+-
+-## Швидкий старт (4 термінали, з кореня backend_py)
++## Варіант 1 — найпростіший: вбудований симулятор (без брокера й пристрою)
+ ```bash
+-pip install -r requirements.txt -r testbench/requirements.txt
+-# 0) MQTT-брокер: docker run -p 1883:1883 eclipse-mosquitto:2 mosquitto -c /mosquitto-no-auth.conf
+-#    або `mosquitto -p 1883`, або публічний broker.hivemq.com (тоді --broker і MQTT_URL відповідно)
+-
+-# 1) backend (без Mongo)          # або з реальною: python -m app  (потрібен .env)
+-PORT=3001 MQTT_URL=mqtt://localhost:1883 python testbench/run_backend_inmemory.py
+-
+-# 2) емулятор: 3 кімнати з різною поведінкою
+-python testbench/device_simulator.py --broker localhost:1883
+-
+-# 3) автоматична перевірка
+-python testbench/e2e_check.py --api http://localhost:3001 --broker localhost:1883
++cd backend
++pip install -r requirements.txt
++cp .env.example .env            # у ньому SIMULATE_DEVICES=true
++uvicorn app.main:app --reload --port 8000
+ ```
+-Усе одним махом у Docker: `docker compose -f testbench/docker-compose.dev.yml up --build`.
++Backend сам створює «віртуальні пристрої» `sim-room-1..3` (сценарії `comfortable`, `stuffy`, `school-day`)
++і пропускає їхні дані через ту саму обробку, що й справжній MQTT: парсинг → конвертація одиниць → SQLite.
+ 
+-## Перевірка frontend вручну
++Перевірка:
+ ```bash
+-cd frontend/client && npm install
+-VITE_API_BASE_URL=http://localhost:3001 npm run dev
++curl localhost:8000/api/comfort/sim-room-1/sensors
++curl localhost:8000/api/comfort/sim-room-2
++curl localhost:8000/api/comfort/sim-room-2/recommendations
++python testbench/e2e_check.py --api http://localhost:8000
+ ```
+-1. Зареєструйтесь → створіть локацію → «додати кімнату», вставте id з консолі емулятора
+-   (`com-…-fort`; вони стабільні між запусками). Кімнату можна додати лише після першої телеметрії.
+-2. Очікувано: `school-day` — CO₂ «пилкою» (росте на уроках, падає на перервах, температура ~20–21 °C),
+-   `comfortable` — високий відсоток комфорту, `stuffy` — CO₂ росте, температура >25 °C, відсоток падає.
+-3. Для швидкої динаміки: `--speed 30 --interval-ms 3000` (1 с реального часу ≈ 30 с моделі; урок видно за ~1,5 хв).
+-4. Налаштування кімнати: вкажіть **Wi-Fi `Komiki` / `Parol222`** (як у прошивці) — тоді пристрій застосує нові
+-   units/interval (видно в консолі емулятора). З іншим Wi-Fi прошивка налаштування відхиляє — емулятор теж
+-   (`--accept-any-wifi`, щоб вимкнути).
+-5. `e2e_check.py --keep` лишає створену локацію та виводить логін/пароль, щоб подивитись її у frontend.
++Налаштування: `SIMULATE_DEVICE_IDS`, `SIMULATE_INTERVAL_SEC` у `.env`.
+ 
+-## Команди емулятора (вводяться в його терміналі)
+-`status` · `scenario stuffy 0` (сценарій, номер пристрою) · `offline on|off` (втрата Wi-Fi: вимірювання
+-копляться й відправляються пачкою) · `bad` (некоректні payload — backend має ігнорувати) · `burst 20` · `quit`.
+-Сценарії: `school-day`, `comfortable`, `stuffy`, `cold-dark`, `noisy`.
+-Опції: `--devices N`, `--ids a,b`, `--ts-format iso|epoch`, `--offline-prob 0.2`, `--firmware-cycle`
+-(підключатись/відключатись щоцикл, як прошивка), `--seed`.
++## Варіант 2 — через MQTT (емулятор `device_simulator.py`)
++```bash
++docker run -d -p 1883:1883 eclipse-mosquitto:2 mosquitto -c /mosquitto-no-auth.conf
++MQTT_URL=mqtt://localhost:1883 SIMULATE_DEVICES=false uvicorn app.main:app --port 8000
++pip install -r testbench/requirements.txt
++python testbench/device_simulator.py --broker localhost:1883 --speed 30 --interval-ms 3000
++python testbench/e2e_check.py --api http://localhost:8000 --devices <id з консолі емулятора>
++```
++Усе в Docker: `docker compose -f testbench/docker-compose.dev.yml up --build`.
+ 
+-## Наскільки це схоже на справжній пристрій
+-Повторено з прошивки: формат id, топіки, структура payload, ISO-час, сирі 16-бітні значення АЦП для
+-gas/sound/light (я виводжу їх обертанням формул backend, щоб на екрані були реальні ppm/дБ/лк), цілі T/H від DHT11,
+-буфер вимірювань, retained status + last will, перевірка й застосування settings. Не емулюється: Wi-Fi/NTP на
+-рівні мережі (NTP-хост лише перевіряється на валідність імені), OTA, кнопка/світлодіод, access point.
++Команди консолі емулятора: `status`, `scenario stuffy 0`, `offline on|off`, `bad`, `burst 20`, `quit`.
+ 
+-## Що виявив стенд (є і в оригінальному коді)
+-1. **Формат часу.** Прошивка шле `timestamp` як ISO-рядок, а `MQTT.md` і Node-backend очікують epoch-секунди
+-   (у Node `Number("2025-…Z")` = NaN → некоректна дата). У Python-версії backend тепер приймає обидва формати.
+-2. **Налаштування з UI.** Форма шле лише заповнені поля, backend підставляє порожні `wifi.ssid`/`mqtt.server`,
+-   а прошивка перевіряє підключення до Wi-Fi — тож зміна, наприклад, лише units **відхиляється** пристроєм.
+-   Варто, щоб backend брав поточні значення (напр. зберігав їх у БД) або UI вимагав Wi-Fi.
+-3. **Прошивка зараз не підписується на settings** (блок у `states/ota.py` закоментований) — реальний пристрій
+-   налаштувань з backend не отримає, поки це не розкоментують. Емулятор підписується, як задумано.
+-4. **Одиниці температури.** Прошивка лише підписує `units` (standard/metric/imperial), значення завжди °C;
+-   формули комфорту на backend теж припускають °C.
+-5. **Помилки на фронтенді.** `request()` читає `error.message`, а backend віддає `error.error.message` —
+-   користувач завжди бачить «API Error».
+-6. Для рекомендацій AI потрібен `OPENAI_API_KEY`; без нього поради порожні (e2e покаже ⚠️).
++## Нотатки
++- Для AI-порад потрібен `OPENAI_API_KEY`; без нього повертаються прості поради за правилами.
++- Топік телеметрії: `iot/device/<id>/telemetry`. Поточна прошивка (`device/`) публікує в
++  `<department>/<room>/Sensor/<id>/data` з іншим payload — це ще треба узгодити.
+diff --git a/backend/testbench/__pycache__/device_simulator.cpython-313.pyc b/backend/testbench/__pycache__/device_simulator.cpython-313.pyc
+deleted file mode 100644
+index c49e803f664548e8eebb7bd9972a13d999489672..0000000000000000000000000000000000000000
+GIT binary patch
+literal 0
+HcmV?d00001
+
+literal 37546
+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
+X-ZC-n*X4hxH-2j;_Ga`2Y<T}agM<*>
+
+diff --git a/backend/testbench/docker-compose.dev.yml b/backend/testbench/docker-compose.dev.yml
+index 6430af1..3886ddd 100644
+--- a/backend/testbench/docker-compose.dev.yml
++++ b/backend/testbench/docker-compose.dev.yml
+@@ -1,21 +1,21 @@
+-# Локальний стенд: MongoDB + MQTT-брокер + backend.  Запуск (з папки testbench):
++# Local stand: MQTT broker (Mosquitto) + backend (SQLite, no MongoDB).
++# Run from the testbench folder:
+ #   docker compose -f docker-compose.dev.yml up --build
+-# Потім:  python device_simulator.py   і   python e2e_check.py
++# Then (optionally, to emulate a device over MQTT):  python device_simulator.py --broker localhost:1883
+ services:
+-  mongo:
+-    image: mongo:7
+-    ports: ["27017:27017"]
+   mosquitto:
+     image: eclipse-mosquitto:2
+     ports: ["1883:1883"]
+     volumes: ["./mosquitto.conf:/mosquitto/config/mosquitto.conf:ro"]
+   backend:
+     build: ..
+-    ports: ["3001:3001"]
++    ports: ["8000:8000"]
+     environment:
+-      PORT: "3001"
+-      MONGO_URI: mongodb://mongo:27017
++      DATABASE_URL: sqlite:////data/school_env.db
+       MQTT_URL: mqtt://mosquitto:1883
+-      JWT_SECRET: dev-secret
++      SIMULATE_DEVICES: "false"   # set to "true" to use the built-in simulator instead of MQTT
+       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+-    depends_on: [mongo, mosquitto]
++    volumes: ["backend_data:/data"]
++    depends_on: [mosquitto]
++volumes:
++  backend_data:
+diff --git a/backend/testbench/e2e_check.py b/backend/testbench/e2e_check.py
+index b9bcbaf..c9238b7 100644
+--- a/backend/testbench/e2e_check.py
++++ b/backend/testbench/e2e_check.py
+@@ -1,247 +1,75 @@
+ #!/usr/bin/env python3
+ """
+-End-to-end test: device(emulator) -> MQTT -> backend -> MongoDB -> REST (what frontend sees).
+-Run when broker, backend and device_simulator.py are running.
++End-to-end check: device (built-in simulator OR device_simulator.py over MQTT) -> backend -> SQLite -> REST.
+ 
+-  python testbench/e2e_check.py --api http://localhost:3001 --broker localhost:1883
++  # variant 1: no broker, no device
++  SIMULATE_DEVICES=true SIMULATE_INTERVAL_SEC=2 uvicorn app.main:app --port 8000
++  python testbench/e2e_check.py --api http://localhost:8000 --devices sim-room-1,sim-room-2,sim-room-3
++
++  # variant 2: via MQTT (broker + MQTT_URL=mqtt://localhost:1883 + `python testbench/device_simulator.py`)
++  python testbench/e2e_check.py --api http://localhost:8000 --devices <id printed by the emulator>
+ """
+ import argparse
+ import json
+-import random
+-import string
+ import sys
+ import time
+ import urllib.error
+ import urllib.request
+-from datetime import datetime, timezone
+-
+-sys.path.insert(0, __file__.rsplit("/", 1)[0] if "/" in __file__ else ".")
+-from device_simulator import device_id_for  # noqa: E402
+-
+-RESULTS: list[tuple[str, str, str]] = []
+-
+ 
+-def record(status: str, name: str, detail: str = ""):
+-    RESULTS.append((status, name, detail))
+-    icon = {"PASS": "✅", "FAIL": "❌", "WARN": "⚠️ ", "SKIP": "⏭ "}[status]
+-    print(f"{icon} {name}" + (f" — {detail}" if detail else ""), flush=True)
++FAILED = 0
+ 
+ 
+-def check(cond: bool, name: str, detail: str = "", warn_only: bool = False):
+-    record("PASS" if cond else ("WARN" if warn_only else "FAIL"), name, "" if cond else detail)
++def get(base: str, path: str):
++    try:
++        with urllib.request.urlopen(base + path, timeout=10) as r:
++            return r.status, json.loads(r.read() or b"{}")
++    except urllib.error.HTTPError as e:
++        return e.code, {}
++    except OSError as e:
++        return 0, {"error": str(e)}
++
++
++def check(cond: bool, name: str, detail: str = ""):
++    global FAILED
++    print(("✅ " if cond else "❌ ") + name + ("" if cond else f" — {detail}"), flush=True)
++    FAILED += 0 if cond else 1
+     return cond
+ 
+ 
+-class Api:
+-    def __init__(self, base: str): self.base = base.rstrip("/")
+-
+-    def call(self, method: str, path: str, body=None, token: str | None = None):
+-        req = urllib.request.Request(self.base + path, method=method,
+-                                     data=json.dumps(body).encode() if body is not None else None)
+-        req.add_header("Content-Type", "application/json")
+-        if token:
+-            req.add_header("Authorization", f"Bearer {token}")
+-        try:
+-            with urllib.request.urlopen(req, timeout=15) as r:
+-                return r.status, json.loads(r.read() or b"{}")
+-        except urllib.error.HTTPError as e:
+-            try:
+-                return e.code, json.loads(e.read() or b"{}")
+-            except ValueError:
+-                return e.code, {}
+-
+-
+-def parse_iso(ts: str) -> datetime:
+-    return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+-
+-
+ def main():
+     ap = argparse.ArgumentParser()
+-    ap.add_argument("--api", default="http://localhost:3001")
+-    ap.add_argument("--broker", default="localhost:1883")
+-    ap.add_argument("--devices", type=int, default=3)
+-    ap.add_argument("--ids", help="device ids separated by comma (if not default)")
+-    ap.add_argument("--wait", type=int, default=60, help="how long to wait for first telemetry, s")
+-    ap.add_argument("--wifi-ssid", default="Komiki"); ap.add_argument("--wifi-password", default="Parol222")
+-    ap.add_argument("--keep", action="store_true", help="do not delete created location (to view in frontend)")
++    ap.add_argument("--api", default="http://localhost:8000")
++    ap.add_argument("--devices", default="sim-room-1,sim-room-2,sim-room-3")
++    ap.add_argument("--wait", type=int, default=30, help="seconds to wait for first telemetry")
+     a = ap.parse_args()
+-    api = Api(a.api)
+-    ids = a.ids.split(",") if a.ids else [device_id_for(i) for i in range(a.devices)]
+-    rnd = "".join(random.choices(string.ascii_lowercase + string.digits, k=6))
+-
+-    print(f"\n== 1. Backend available ({a.api}) ==")
+-    for _ in range(20):
+-        try:
+-            st, body = api.call("GET", "/")
+-            break
+-        except OSError:
+-            time.sleep(1)
+-    else:
+-        record("FAIL", "GET /", "backend not responding"); return finish()
+-    check(st == 200 and body.get("message") == "Backend is running", "GET / responds")
+-
+-    print("\n== 2. Telemetry from emulator reached DB (device → MQTT → backend → MongoDB) ==")
+-    readings = {}
+-    deadline = time.time() + a.wait
+-    pending = set(ids)
+-    while pending and time.time() < deadline:
+-        for did in list(pending):
+-            st, body = api.call("GET", f"/api/comfort/{did}/sensors")
+-            if st == 200:
+-                readings[did] = body["data"]; pending.discard(did)
+-        time.sleep(1)
+-    for did in ids:
+-        if not check(did in readings, f"device {did[4:12]}… telemetry saved", f"no data for {a.wait} s — is device_simulator.py running with same broker?"):
+-            continue
+-        d = readings[did]; r = d["latestReading"]
+-        check(set(r["units"]) == {"temperature", "humidity", "gas", "light", "sound"} and all(r["units"].values()),
+-              "  units for 5 sensors", str(r["units"]))
+-        check(-10 <= r["temperature"] <= 50 and 0 <= r["humidity"] <= 100, "  temperature/humidity plausible", f"{r['temperature']}°C {r['humidity']}%")
+-        check(200 <= r["gas"] <= 10000 and 40 <= r["sound"] <= 120 and 0.1 <= r["light"] <= 100000,
+-              "  gas/sound/light in backend conversion ranges", f"gas={r['gas']} sound={r['sound']} light={r['light']}")
+-        age = (datetime.now(timezone.utc) - parse_iso(d["timestamp"])).total_seconds()
+-        check(-5 <= age <= 120, "  timestamp fresh and recognized (ISO from firmware)", f"age {age:.0f} s, timestamp={d['timestamp']}")
+-        st, c = api.call("GET", f"/api/comfort/{did}")
+-        check(st == 200 and isinstance(c["data"]["comfortPercentage"], int) and 0 <= c["data"]["comfortPercentage"] <= 100,
+-              "  comfort percentage 0..100", f"{st} {c}")
+-    live_ids = [d for d in ids if d in readings]
+-
+-    print("\n== 3. Auth ==")
+-    email, pw = f"e2e-{rnd}@test.local", "secret123"
+-    st, b = api.call("POST", "/api/auth/register", {"username": f"e2e-{rnd}", "email": email, "password": pw})
+-    check(st == 201 and b["data"]["token"], "registration → 201 + token", f"{st} {b}")
+-    st, b2 = api.call("POST", "/api/auth/register", {"username": "x", "email": email, "password": pw})
+-    check(st == 400, "duplicate email → 400", f"{st}")
+-    st, b2 = api.call("POST", "/api/auth/login", {"email": email, "password": "wrong-pass"})
+-    check(st == 401, "wrong password → 401", f"{st}")
+-    st, lg = api.call("POST", "/api/auth/login", {"email": email, "password": pw})
+-    token = lg["data"]["token"]
+-    check(st == 200 and lg["data"]["user"]["email"] == email, "login")
+-    st, me = api.call("GET", "/api/auth/me", token=token)
+-    check(st == 200 and me["data"]["username"] == f"e2e-{rnd}", "GET /me with token")
+-    check(api.call("GET", "/api/auth/me")[0] == 401, "GET /me without token → 401")
+-
+-    print("\n== 4. Locations and rooms (frontend scenario) ==")
+-    st, loc = api.call("POST", "/api/locations", {"name": f"E2E School {rnd}"}, token)
+-    check(st == 201, "create location", f"{st} {loc}")
+-    lid = loc["data"]["id"]
+-    check(api.call("POST", f"/api/locations/{lid}/devices", {"deviceId": "com-ffffffffffffffff-fort"}, token)[0] == 404,
+-          "add non-existent device → 404")
+-    for i, did in enumerate(live_ids):
+-        st, _ = api.call("POST", f"/api/locations/{lid}/devices", {"deviceId": did, "name": f"Room {i + 1}"}, token)
+-        check(st == 200, f"add device {did[4:12]}… as "Room {i + 1}"", f"{st}")
+-    st, lst = api.call("GET", "/api/locations", token=token)
+-    mine = [x for x in lst["data"]["created"] if x["id"] == lid]
+-    check(bool(mine) and sorted(mine[0]["deviceIds"]) == sorted(live_ids), "location list contains all devices")
+-    if live_ids:
+-        d0 = live_ids[0]
+-        st, s = api.call("GET", f"/api/comfort/{d0}/sensors")
+-        check(s["data"]["name"] == "Room 1" and s["data"]["hidden"] is False, "room name saved", str(s))
+-        check(api.call("PATCH", f"/api/locations/{lid}/devices/{d0}/hide", token=token)[0] == 200
+-              and api.call("GET", f"/api/comfort/{d0}/sensors")[1]["data"]["hidden"] is True, "hide room")
+-        check(api.call("PATCH", f"/api/locations/{lid}/devices/{d0}/show", token=token)[0] == 200
+-              and api.call("GET", f"/api/comfort/{d0}/sensors")[1]["data"]["hidden"] is False, "show room")
+-        st, rec = api.call("GET", f"/api/comfort/{d0}/recommendations")
+-        tips = rec.get("data", {}).get("recommendations")
+-        check(st == 200 and isinstance(tips, list), "recommendations: 200 and list", f"{st} {rec}")
+-        check(bool(tips), "  AI returned tips (OPENAI_API_KEY needed)", "empty list", warn_only=True)
+-        if tips:
+-            check(all({"priority", "type", "message", "reason"} <= set(t) for t in tips), "  tips structure")
+-
+-    print("\n== 5. Second user and permissions ==")
+-    st, ub = api.call("POST", "/api/auth/register", {"username": f"guest-{rnd}", "email": f"guest-{rnd}@test.local", "password": pw})
+-    tok2, uid2 = ub["data"]["token"], ub["data"]["user"]["id"]
+-    check(api.call("PATCH", f"/api/locations/{lid}", {"name": "hack"}, tok2)[0] == 403, "non-admin cannot rename location → 403")
+-    check(api.call("POST", f"/api/locations/{lid}/users", {"targetUserId": uid2}, token)[0] == 200, "admin adds user")
+-    st, l2 = api.call("GET", "/api/locations", token=tok2)
+-    check(any(x["id"] == lid for x in l2["data"]["joined"]), "location appears in guest's 'joined'")
+-    if live_ids:
+-        check(api.call("PATCH", f"/api/locations/{lid}/devices/{live_ids[0]}/hide", token=tok2)[0] == 403, "guest cannot hide room → 403")
+-    check(api.call("DELETE", f"/api/locations/{lid}/users/{uid2}", token=token)[0] == 200, "admin removes user")
+-
+-    print("\n== 6. Device settings: backend → MQTT → device → new data ==")
+-    if live_ids:
+-        d0 = live_ids[0]
+-        body = {"name": "Room 1 (renamed)", "units": "metric", "interval": 3000, "ntpHost": "pool.ntp.org",
+-                "brokerAddress": a.broker.split(":")[0], "wifiSsid": a.wifi_ssid, "wifiPassword": a.wifi_password}
+-        st, r = api.call("PATCH", f"/api/locations/{lid}/devices/{d0}/settings", body, token)
+-        check(st == 200 and r["data"]["topic"] == f"iot/backend/{d0}/settings", "PATCH settings published to MQTT", f"{st} {r}")
+-        print("   waiting for device to apply settings (interval 3 s, units=metric)…")
+-        stamps, units, t_end = set(), None, time.time() + 45
+-        while time.time() < t_end:
+-            s = api.call("GET", f"/api/comfort/{d0}/sensors")[1]["data"]
+-            units = s["latestReading"]["units"]["temperature"]
+-            stamps.add(s["timestamp"])
+-            if units == "metric":
++    base = a.api.rstrip("/")
++
++    status, _ = get(base, "/health")
++    if not check(status == 200, "backend is up", f"GET /health -> {status}"):
++        sys.exit(1)
++
++    for dev in [d.strip() for d in a.devices.split(",") if d.strip()]:
++        print(f"\n== device {dev} ==")
++        deadline, data = time.time() + a.wait, None
++        while time.time() < deadline:
++            status, body = get(base, f"/api/comfort/{dev}/sensors")
++            if status == 200:
++                data = body["data"]
+                 break
+             time.sleep(1)
+-        check(units == "metric", "device applied units=metric (visible in REST)", f"units={units} — is emulator running with same Wi-Fi?")
+-        seen, t_end = {}, time.time() + 12
+-        while time.time() < t_end:
+-            seen[api.call("GET", f"/api/comfort/{d0}/sensors")[1]["data"]["timestamp"]] = 1
+-            time.sleep(0.5)
+-        check(len(seen) >= 3, "update frequency increased (≥3 new timestamps in 12 s with interval 3 s)", f"was {len(seen)}")
+-        check(api.call("GET", f"/api/comfort/{d0}/sensors")[1]["data"]["name"] == "Room 1 (renamed)", "new room name saved")
+-
+-        # Firmware rejects settings with wrong Wi-Fi — frequency should not change to 20 s
+-        bad = dict(body, interval=20000, wifiPassword="WRONG-PASSWORD")
+-        api.call("PATCH", f"/api/locations/{lid}/devices/{d0}/settings", bad, token)
+-        time.sleep(5)
+-        seen, t_end = {}, time.time() + 10
+-        while time.time() < t_end:
+-            seen[api.call("GET", f"/api/comfort/{d0}/sensors")[1]["data"]["timestamp"]] = 1
+-            time.sleep(0.5)
+-        check(len(seen) >= 2, "settings with wrong Wi-Fi rejected by device (frequency remained ~3 s)", f"{len(seen)} updates in 10 s",
+-              warn_only=True)
+-        api.call("PATCH", f"/api/locations/{lid}/devices/{d0}/settings", dict(body, interval=10000), token)
+-
+-    print("\n== 7. Resistance to incorrect telemetry and time formats ==")
+-    try:
+-        import paho.mqtt.client as mqtt
+-        host, _, port = a.broker.partition(":")
+-        c = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=f"e2e-{rnd}")
+-        c.connect(host, int(port or 1883)); c.loop_start()
+-        def sensors(ts):
+-            return {"timestamp": ts, "sensors": {
+-                "temperature": {"value": 22, "units": "standard"}, "humidity": {"value": 45, "units": "%"},
+-                "sound": {"value": 6000, "units": "dB"}, "gas": {"value": 2000, "units": "ppm"}, "light": {"value": 300, "units": "lx"}}}
+-        base = f"com-e2e{rnd}"
+-        pubs = {
+-            f"{base}bad-fort": ["{not json", json.dumps({"sensors": {}}),
+-                                json.dumps({"timestamp": 1, "sensors": {**sensors(1)["sensors"], "gas": {"value": 5}}})],
+-            f"{base}iso-fort": [json.dumps(sensors("2025-12-17T13:33:07Z"))],
+-            f"{base}epoch-fort": [json.dumps(sensors(1765978387))],
+-        }
+-        for dev, msgs in pubs.items():
+-            for m in msgs:
+-                c.publish(f"iot/device/{dev}/telemetry", m, qos=1).wait_for_publish(3)
+-        time.sleep(2)
+-        st, _ = api.call("GET", f"/api/comfort/{base}bad-fort/sensors")
+-        check(st == 404, "incorrect payloads (not JSON / no sensors / no units) rejected", f"status {st}")
+-        for kind in ("iso", "epoch"):
+-            st, r = api.call("GET", f"/api/comfort/{base}{kind}-fort/sensors")
+-            ok = st == 200 and r["data"]["timestamp"] == "2025-12-17T13:33:07.000Z"
+-            check(ok, f"timestamp in {kind.upper()} format recognized correctly", f"{st} {r.get('data', {}).get('timestamp')}")
+-        c.loop_stop(); c.disconnect()
+-    except OSError as exc:
+-        record("SKIP", "incorrect telemetry check", f"broker unavailable: {exc}")
+-
+-    print("\n== 8. Cleanup ==")
+-    if a.keep:
+-        record("SKIP", "location deletion", f"left for viewing in frontend: {email} / {pw}")
+-    else:
+-        check(api.call("DELETE", f"/api/locations/{lid}", token=token)[0] == 200, "delete location")
+-        check(api.call("GET", f"/api/locations/{lid}")[0] == 404, "location disappeared")
+-    finish()
+-
+-
+-def finish():
+-    n = {k: sum(1 for r in RESULTS if r[0] == k) for k in ("PASS", "FAIL", "WARN", "SKIP")}
+-    print(f"\n{'=' * 60}\nSummary: ✅ {n['PASS']}  ❌ {n['FAIL']}  ⚠️  {n['WARN']}  ⏭ {n['SKIP']}")
+-    for s, name, detail in RESULTS:
+-        if s in ("FAIL", "WARN"):
+-            print(f"  {s}: {name} {detail}")
+-    sys.exit(1 if n["FAIL"] else 0)
++        if not check(data is not None, "telemetry reached DB and REST", f"no data within {a.wait}s"):
++            continue
++        r = data["latestReading"]
++        check(all(k in r for k in ("temperature", "humidity", "gas", "light", "sound")), "all 5 sensors present")
++        check(-10 < r["temperature"] < 50 and 0 <= r["humidity"] <= 100, "temperature/humidity are plausible", str(r))
++        check(200 <= r["gas"] <= 10000 and 40 <= r["sound"] <= 120, "gas/sound converted from raw ADC", str(r))
++        status, body = get(base, f"/api/comfort/{dev}")
++        check(status == 200 and 0 <= body["data"]["comfortPercentage"] <= 100, "comfort percentage", str(body))
++        status, body = get(base, f"/api/comfort/{dev}/recommendations")
++        check(status == 200 and isinstance(body["data"]["recommendations"], list), "recommendations endpoint")
++
++    print("\nRESULT:", "ALL PASSED" if not FAILED else f"{FAILED} FAILED")
++    sys.exit(1 if FAILED else 0)
+ 
+ 
+ if __name__ == "__main__":
+diff --git a/backend/testbench/requirements.txt b/backend/testbench/requirements.txt
+index 56100ce..b0c0a7e 100644
+--- a/backend/testbench/requirements.txt
++++ b/backend/testbench/requirements.txt
+@@ -1,2 +1 @@
+ paho-mqtt>=2.1
+-mongomock>=4.2    # лише для run_backend_inmemory.py
+diff --git a/backend/testbench/run_backend_inmemory.py b/backend/testbench/run_backend_inmemory.py
+deleted file mode 100644
+index dcf9139..0000000
+--- a/backend/testbench/run_backend_inmemory.py
++++ /dev/null
+@@ -1,52 +0,0 @@
+-#!/usr/bin/env python3
+-"""Запускає backend БЕЗ MongoDB: дані зберігаються в памʼяті (mongomock) і зникають після зупинки.
+-Зручно для швидкої перевірки. MQTT-брокер усе одно потрібен (MQTT_URL).
+-
+-  pip install mongomock
+-  MQTT_URL=mqtt://localhost:1883 PORT=3001 python testbench/run_backend_inmemory.py
+-"""
+-import os
+-import sys
+-from pathlib import Path
+-
+-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+-os.environ.setdefault("JWT_SECRET", "dev-secret")
+-os.environ.setdefault("MONGO_URI", "in-memory")
+-os.environ.setdefault("MQTT_URL", "mqtt://localhost:1883")
+-
+-import mongomock
+-import uvicorn
+-
+-from app.config import settings
+-from app.db import database
+-
+-
+-class _Cursor:
+-    def __init__(self, cur): self.cur = cur
+-    async def to_list(self, _=None): return list(self.cur)
+-
+-
+-class _AsyncCollection:
+-    def __init__(self, col): self.col = col
+-    def __getattr__(self, name):
+-        fn = getattr(self.col, name)
+-        if name == "find":
+-            return lambda *a, **k: _Cursor(fn(*a, **k))
+-        async def call(*a, **k): return fn(*a, **k)
+-        return call
+-
+-
+-class _FakeDb:
+-    def __init__(self): self.db = mongomock.MongoClient().db
+-    def __getitem__(self, name): return _AsyncCollection(self.db[name])
+-
+-
+-async def _connect(uri, name):
+-    database.db = _FakeDb()
+-    print("✅ In-memory database (mongomock) — data not saved between runs")
+-
+-database.connect = _connect
+-
+-if __name__ == "__main__":
+-    from app.main import app
+-    uvicorn.run(app, host="0.0.0.0", port=settings.port)
+diff --git a/backend/tests/conftest.py b/backend/tests/conftest.py
+index 3a1de3c..569fb4e 100644
+--- a/backend/tests/conftest.py
++++ b/backend/tests/conftest.py
+@@ -8,7 +8,7 @@ from app.main import app
+ 
+ 
+ @pytest.fixture
+-def client(tmp_path):
++def client(tmp_path, monkeypatch):
+     # Create a separate temporary SQLite database
+     database_url = f"sqlite:///{(tmp_path / 'test.db').as_posix()}"
+ 
+@@ -24,6 +24,8 @@ def client(tmp_path):
+     )
+ 
+     Base.metadata.create_all(bind=engine)
++    # telemetry repository opens its own sessions -> point it at the same temp DB
++    monkeypatch.setattr("app.db.SessionLocal", TestingSessionLocal)
+ 
+     def override_get_db():
+         db = TestingSessionLocal()
+diff --git a/backend/tests/test_api.py b/backend/tests/test_api.py
+index 0301d43..9bbdd08 100644
+--- a/backend/tests/test_api.py
++++ b/backend/tests/test_api.py
+@@ -1,151 +1,102 @@
+-"""Smoke test of entire API on mongomock (real MongoDB not needed)."""
++"""Telemetry -> SQLite -> comfort/sensors REST (no MongoDB, no MQTT broker, no device needed)."""
+ import asyncio
+ import json
+ import os
++import time
+ 
+-os.environ["JWT_SECRET"] = "test-secret"
+-
+-import mongomock
+ import pytest
+-from fastapi.testclient import TestClient
+ 
+-from app.comfort import calculate_manual_comfort
+-from app.db import database
+-from app.main import app
++from app import comfort, simulator
++from app.comfort import calculate_manual_comfort, rule_based_tips
+ from app.telemetry import convert_units, handle_message, parse_telemetry, parse_timestamp
+ 
+ 
+-class _Cursor:
+-    def __init__(self, cur): self.cur = cur
+-    async def to_list(self, _=None): return list(self.cur)
+-
+-
+-class _AsyncCollection:
+-    def __init__(self, col): self.col = col
+-    def __getattr__(self, name):
+-        fn = getattr(self.col, name)
+-        if name == "find":
+-            return lambda *a, **k: _Cursor(fn(*a, **k))
+-        async def call(*a, **k): return fn(*a, **k)
+-        return call
+-
+-
+-class _FakeDb:
+-    def __init__(self): self.db = mongomock.MongoClient().db
+-    def __getitem__(self, name): return _AsyncCollection(self.db[name])
+-
+-
+-@pytest.fixture()
+-def client():
+-    database.db = _FakeDb()
+-    return TestClient(app)  # without `with` -> lifespan (real Mongo/MQTT) does not start
+-
+-
+-def hdr(token): return {"Authorization": f"Bearer {token}"}
+-
+-
+-def register(c, name, email):
+-    r = c.post("/api/auth/register", json={"username": name, "email": email, "password": "secret1"})
+-    assert r.status_code == 201, r.text
+-    return r.json()["data"]
+-
+-
+-def telemetry(device_id, raw=32768):
+-    payload = {"timestamp": 1765978387, "sensors": {
++def telemetry(device_id, raw=32768, ts=1765978387):
++    payload = {"timestamp": ts, "sensors": {
+         "temperature": {"value": 22, "units": "C"}, "humidity": {"value": 45, "units": "%"},
+         "gas": {"value": raw, "units": "ppm"}, "light": {"value": raw, "units": "lx"},
+         "sound": {"value": raw, "units": "dB"}}}
+     asyncio.run(handle_message(f"iot/device/{device_id}/telemetry", json.dumps(payload).encode()))
+ 
+ 
+-def test_auth(client):
+-    assert client.get("/").json() == {"message": "Backend is running"}
+-    assert client.post("/api/auth/register", json={"email": "a@b.c"}).json()["error"]["message"] == "All fields are required"
+-    assert client.post("/api/auth/register", json={"username": "u", "email": "bad", "password": "123456"}).status_code == 400
+-    d = register(client, "roma", "roma@x.sk")
+-    assert client.post("/api/auth/register", json={"username": "r", "email": "roma@x.sk", "password": "123456"}).status_code == 400
+-    assert client.post("/api/auth/login", json={"email": "roma@x.sk", "password": "wrong!!"}).status_code == 401
+-    login = client.post("/api/auth/login", json={"email": "roma@x.sk", "password": "secret1"}).json()["data"]
+-    assert login["user"]["id"] == d["user"]["id"] and login["user"]["createdAt"].endswith("Z")
+-    assert client.get("/api/auth/me", headers=hdr(login["token"])).json()["data"]["username"] == "roma"
+-    assert client.get("/api/auth/me").json()["error"]["message"] == "No token provided"
+-    assert client.get("/api/auth/me", headers=hdr("garbage")).status_code == 401
+-
+-
+-def test_locations_and_devices(client):
+-    admin, other = register(client, "a", "a@x.sk"), register(client, "o", "o@x.sk")
+-    A, O = hdr(admin["token"]), hdr(other["token"])
+-
+-    loc = client.post("/api/locations", json={"name": "Lab"}, headers=A).json()["data"]
+-    lid = loc["id"]
+-    lst = client.get("/api/locations", headers=A).json()["data"]
+-    assert [l["id"] for l in lst["created"]] == [lid] and lst["joined"] == []
+-
+-    assert client.patch(f"/api/locations/{lid}", json={"name": "X"}, headers=O).status_code == 403
+-    assert client.patch(f"/api/locations/{lid}", json={"name": "Lab2"}, headers=A).status_code == 200
+-    assert client.get("/api/locations/not-an-id").status_code == 404
+-
+-    assert client.post(f"/api/locations/{lid}/devices", json={"deviceId": "dev1"}, headers=A).status_code == 404
++def test_sensors_and_comfort(client):
++    assert client.get("/api/comfort/dev1/sensors").status_code == 404
+     telemetry("dev1")
+-    assert client.post(f"/api/locations/{lid}/devices", json={"deviceId": "dev1", "name": "Room 1"}, headers=A).status_code == 200
+-
+     s = client.get("/api/comfort/dev1/sensors").json()["data"]
+-    assert s["name"] == "Room 1" and s["hidden"] is False
++    assert s["deviceId"] == "dev1"
+     assert s["latestReading"]["gas"] == 5100 and s["latestReading"]["sound"] == 80
+     assert s["timestamp"] == "2025-12-17T13:33:07.000Z"
+     assert client.get("/api/comfort/dev1").json()["data"]["comfortPercentage"] == 45
++    assert client.get("/api/comfort/missing").status_code == 404
++
++
++def test_latest_reading_wins(client):
++    telemetry("dev2", raw=0, ts=1765978000)
++    telemetry("dev2", raw=65535, ts=1765978387)
++    assert client.get("/api/comfort/dev2/sensors").json()["data"]["latestReading"]["gas"] == 10000
+ 
+-    assert client.patch(f"/api/locations/{lid}/devices/dev1/hide", headers=A).status_code == 200
+-    assert client.get("/api/comfort/dev1/sensors").json()["data"]["hidden"] is True
+-    assert client.patch(f"/api/locations/{lid}/devices/dev1/show", headers=A).status_code == 200
+-    r = client.patch(f"/api/locations/{lid}/devices/dev1/settings", json={"interval": 5000}, headers=A).json()["data"]
+-    assert r["topic"] == "iot/backend/dev1/settings" and r["settings"]["measurement_interval"] == 5000
+ 
+-    assert client.post(f"/api/locations/{lid}/users", json={"targetUserId": other["user"]["id"]}, headers=A).status_code == 200
+-    assert client.post(f"/api/locations/{lid}/users", json={"targetUserId": other["user"]["id"]}, headers=A).status_code == 400
+-    assert len(client.get("/api/locations", headers=O).json()["data"]["joined"]) == 1
+-    assert client.delete(f"/api/locations/{lid}/users/{admin['user']['id']}", headers=A).status_code == 400
+-    assert client.delete(f"/api/locations/{lid}/users/{other['user']['id']}", headers=A).status_code == 200
+-    assert client.delete(f"/api/locations/{lid}", headers=A).status_code == 200
+-    assert client.get("/api/auth/me", headers=A).json()["data"]["ownedLocationIds"] == []
++def test_invalid_payload_ignored(client):
++    asyncio.run(handle_message("iot/device/bad/telemetry", b"not json"))
++    asyncio.run(handle_message("iot/device/bad/telemetry", b'{"sensors": {}}'))
++    assert client.get("/api/comfort/bad/sensors").status_code == 404
++
++
++def test_recommendations_rule_based_without_key(client, monkeypatch):
++    monkeypatch.setattr(comfort.settings, "openai_api_key", "")
++    telemetry("dev-9", raw=65535)  # very high gas/light/sound
++    r = client.get("/api/comfort/dev-9/recommendations")
++    assert r.status_code == 200
++    tips = r.json()["data"]["recommendations"]
++    assert tips and {t["type"] for t in tips} <= {"temperature", "humidity", "gas", "light", "sound"}
++    assert client.get("/api/comfort/missing/recommendations").status_code == 404
+ 
+ 
+ def _fake_ai(create):
+-    """OpenAI client replacement: object with chat.completions.create(**kwargs)."""
+     ns = lambda **kw: type("N", (), kw)  # noqa: E731
+     return ns(chat=ns(completions=ns(create=staticmethod(create))))
+ 
+ 
+ def test_recommendations_openai_success(client, monkeypatch):
++    monkeypatch.setattr(comfort.settings, "openai_api_key", "test")
+     telemetry("dev-8")
+-    from app import comfort
+-    seen = {}
+ 
+     async def create(**kwargs):
+-        seen.update(kwargs)
+         tips = [{"priority": "high", "type": "gas", "message": "Open a window", "reason": "CO2 is high"}]
+         msg = type("M", (), {"content": json.dumps({"recommendations": tips})})
+         return type("R", (), {"choices": [type("C", (), {"message": msg})]})
+ 
+     monkeypatch.setattr(comfort, "_get_ai", lambda: _fake_ai(create))
+     r = client.get("/api/comfort/dev-8/recommendations")
+-    assert r.status_code == 200
+     assert r.json()["data"]["recommendations"][0]["message"] == "Open a window"
+-    assert seen["response_format"]["type"] == "json_schema" and seen["response_format"]["json_schema"]["strict"] is True
+-    assert "gas" in seen["messages"][1]["content"].lower() or "Gas" in seen["messages"][1]["content"]
+ 
+ 
+-def test_recommendations_empty_list_is_ok(client, monkeypatch):
++def test_recommendations_openai_failure_gives_empty_list(client, monkeypatch):
++    monkeypatch.setattr(comfort.settings, "openai_api_key", "test")
+     telemetry("dev-7")
+-    from app import comfort
+ 
+     async def boom(**kwargs): raise RuntimeError("no key")
+ 
+     monkeypatch.setattr(comfort, "_get_ai", lambda: _fake_ai(boom))
+     r = client.get("/api/comfort/dev-7/recommendations")
+     assert r.status_code == 200 and r.json()["data"]["recommendations"] == []
+-    assert r.json()["data"]["audienceId"] is None
+-    assert client.get("/api/comfort/missing/recommendations").status_code == 404
++
++
++def test_simulator_feeds_pipeline(client):
++    """Simulated device payloads go through the same pipeline as real MQTT data."""
++    import random
++    for scenario in ("comfortable", "stuffy", "school-day"):
++        payload = simulator.make_payload(scenario, 30.0, random.Random(1))
++        asyncio.run(handle_message(f"iot/device/sim-{scenario}/telemetry", json.dumps(payload).encode()))
++    ok_ = client.get("/api/comfort/sim-comfortable").json()["data"]["comfortPercentage"]
++    bad = client.get("/api/comfort/sim-stuffy").json()["data"]["comfortPercentage"]
++    assert ok_ > bad
++    r = client.get("/api/comfort/sim-comfortable/sensors").json()["data"]["latestReading"]
++    assert 400 <= r["gas"] <= 800 and 20 <= r["temperature"] <= 24
++
++
++def test_simulator_disabled_by_default():
++    assert simulator.start() is None
+ 
+ 
+ def test_telemetry_helpers():
+@@ -153,43 +104,28 @@ def test_telemetry_helpers():
+     assert t["temperature"] != t["temperature"]  # NaN
+     assert calculate_manual_comfort({"temperature": 22, "humidity": 45, "gas": 600, "light": 500, "sound": 30}) == 100
+     assert calculate_manual_comfort({"temperature": 27, "humidity": 45, "gas": 600, "light": 500, "sound": 30}) == 88
++    assert rule_based_tips({"temperature": 22, "humidity": 45, "gas": 600, "light": 500, "sound": 30}) == []
+ 
+ 
+ def test_timestamp_formats():
+-    assert parse_timestamp(1765978387) == 1765978387000          # epoch, seconds (MQTT.md)
++    assert parse_timestamp(1765978387) == 1765978387000          # epoch, seconds
+     assert parse_timestamp("1765978387") == 1765978387000
+-    assert parse_timestamp("2025-12-17T13:33:07Z") == 1765978387000   # ISO — firmware format
++    assert parse_timestamp("2025-12-17T13:33:07Z") == 1765978387000   # ISO - firmware format
+     assert parse_timestamp(1765978387000) == 1765978387000       # milliseconds
+-    import time
+     assert abs(parse_timestamp(None) - time.time() * 1000) < 2000
+     assert abs(parse_timestamp("garbage") - time.time() * 1000) < 2000
+ 
+ 
+ def test_openai_api_connection():
+-    """Checks real connection to OpenAI API."""
+-    from openai import OpenAI
+-    from dotenv import load_dotenv
+-
+-    load_dotenv()
+-
++    """Checks real connection to OpenAI API (skipped without OPENAI_API_KEY)."""
+     api_key = os.getenv("OPENAI_API_KEY")
+     if not api_key:
+         pytest.skip("OPENAI_API_KEY is not configured")
+-
+     model = os.getenv("OPENAI_MODEL")
+     if not model:
+-        pytest.fail("OPENAI_MODEL is not configured in .env")
+-
+-    with OpenAI(api_key=api_key) as client:
+-        response = client.chat.completions.create(
+-            model=model,
+-            messages=[
+-                {
+-                    "role": "user",
+-                    "content": "Reply with exactly: OpenAI API works!",
+-                }
+-            ],
+-            max_completion_tokens=30,
+-        )
+-
+-    assert response.choices[0].message.content.strip() == "OpenAI API works!"
++        pytest.fail("OPENAI_MODEL is not configured")
++    from openai import OpenAI
++    with OpenAI(api_key=api_key) as c:
++        r = c.chat.completions.create(model=model, messages=[
++            {"role": "user", "content": "Reply with exactly: OpenAI API works!"}], max_completion_tokens=30)
++    assert r.choices[0].message.content.strip() == "OpenAI API works!"

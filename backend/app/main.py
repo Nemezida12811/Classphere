@@ -1,3 +1,5 @@
+import asyncio
+import logging
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -6,14 +8,25 @@ from app.config import settings
 from app.db import init_db
 from app.routers.auth import router as auth_router
 from app.routers.locations import router as locations_router
+from app.routers.comfort import router as comfort_router
+from app import simulator
+from app.mqtt_client import mqtt_client
+from app.telemetry import handle_message
+
+logging.basicConfig(level=logging.INFO)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup: ensure tables exist
     init_db()
+    # MQTT is optional: without MQTT_URL the backend runs with REST (+ simulator) only
+    mqtt_client.initialize(asyncio.get_running_loop(), handle_message)
+    sim_task = simulator.start()  # no-op unless SIMULATE_DEVICES=true
     yield
-    # Shutdown logic (if any)
+    if sim_task:
+        sim_task.cancel()
+    mqtt_client.close()
 
 
 app = FastAPI(
@@ -37,6 +50,7 @@ app.add_middleware(
 # Register routers
 app.include_router(auth_router, prefix=settings.API_V1_PREFIX)
 app.include_router(locations_router, prefix=settings.API_V1_PREFIX)
+app.include_router(comfort_router)  # /api/comfort/...
 
 
 @app.get("/health", tags=["Health"])

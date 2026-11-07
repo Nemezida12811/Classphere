@@ -8,7 +8,7 @@ from app.main import app
 
 
 @pytest.fixture
-def client(tmp_path):
+def client(tmp_path, monkeypatch):
     # Create a separate temporary SQLite database
     database_url = f"sqlite:///{(tmp_path / 'test.db').as_posix()}"
 
@@ -24,6 +24,8 @@ def client(tmp_path):
     )
 
     Base.metadata.create_all(bind=engine)
+    # telemetry repository opens its own sessions -> point it at the same temp DB
+    monkeypatch.setattr("app.db.SessionLocal", TestingSessionLocal)
 
     def override_get_db():
         db = TestingSessionLocal()

@@ -81,10 +81,37 @@ async def calculate_comfort_by_audience(audience_id: str) -> dict | None:
     }
 
 
+def rule_based_tips(latest: dict) -> list:
+    """Offline fallback (no OPENAI_API_KEY): simple tips from the ideal ranges."""
+    advice = {
+        "temperature": ("Open a window or lower the heating", "Open a window or raise the heating"),
+        "humidity": ("Ventilate the room or use a dehumidifier", "Use a humidifier or ventilate"),
+        "gas": ("Ventilate the room - CO2 is high", "Air quality is fine"),
+        "light": ("Reduce glare or dim the lights", "Turn on more lighting"),
+        "sound": ("Reduce noise levels", "Noise is fine"),
+    }
+    tips = []
+    for field, (lo, hi), threshold in _METRICS:
+        val = latest[field]
+        if lo <= val <= hi:
+            continue
+        deviation = (lo - val) if val < lo else (val - hi)
+        ratio = deviation / threshold
+        tips.append({
+            "priority": "high" if ratio > 0.6 else "medium" if ratio > 0.3 else "low",
+            "type": field,
+            "message": advice[field][1 if val < lo else 0],
+            "reason": f"{field} is {val} (ideal {lo}-{hi})",
+        })
+    return tips[:3]
+
+
 async def generate_tips(audience_id: str) -> list | None:
     latest = await SensorReadings.find_latest(audience_id)
     if not latest:
         return None
+    if not settings.openai_api_key:
+        return rule_based_tips(latest)
 
     u = latest.get("units") or {}
     prompt = f"""You are an indoor comfort inspector. You have the following sensor data:

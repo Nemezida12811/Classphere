@@ -15,6 +15,19 @@ class Settings(BaseSettings):
     # Database: SQLite by default for easy local dev; Postgres in prod/docker
     DATABASE_URL: str = os.getenv("DATABASE_URL", "sqlite:///./school_env.db")
 
+    # MQTT (empty -> MQTT is disabled; the backend then works with REST + simulator only)
+    mqtt_url: str = ""
+    mqtt_client_id: str = "smart-school-backend"
+
+    # Built-in device simulator: lets you run the whole project without a physical device
+    simulate_devices: bool = False
+    simulate_device_ids: str = "sim-room-1,sim-room-2,sim-room-3"
+    simulate_interval_sec: float = 5.0
+
+    # AI recommendations (optional; without a key a simple rule-based fallback is used)
+    openai_api_key: str = ""
+    openai_model: str = "gpt-4o-mini"
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",

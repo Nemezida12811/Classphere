@@ -1,21 +1,21 @@
-# Локальний стенд: MongoDB + MQTT-брокер + backend.  Запуск (з папки testbench):
+# Local stand: MQTT broker (Mosquitto) + backend (SQLite, no MongoDB).
+# Run from the testbench folder:
 #   docker compose -f docker-compose.dev.yml up --build
-# Потім:  python device_simulator.py   і   python e2e_check.py
+# Then (optionally, to emulate a device over MQTT):  python device_simulator.py --broker localhost:1883
 services:
-  mongo:
-    image: mongo:7
-    ports: ["27017:27017"]
   mosquitto:
     image: eclipse-mosquitto:2
     ports: ["1883:1883"]
     volumes: ["./mosquitto.conf:/mosquitto/config/mosquitto.conf:ro"]
   backend:
     build: ..
-    ports: ["3001:3001"]
+    ports: ["8000:8000"]
     environment:
-      PORT: "3001"
-      MONGO_URI: mongodb://mongo:27017
+      DATABASE_URL: sqlite:////data/school_env.db
       MQTT_URL: mqtt://mosquitto:1883
-      JWT_SECRET: dev-secret
+      SIMULATE_DEVICES: "false"   # set to "true" to use the built-in simulator instead of MQTT
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
-    depends_on: [mongo, mosquitto]
+    volumes: ["backend_data:/data"]
+    depends_on: [mosquitto]
+volumes:
+  backend_data:

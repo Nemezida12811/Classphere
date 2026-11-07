@@ -1,6 +1,9 @@
+import asyncio
+from datetime import timezone
 from typing import List, Optional
 from sqlalchemy.orm import Session
-from app.db import User, Location
+from app import db as _db
+from app.db import User, Location, SensorReading
 from app.schemas import UserCreate, LocationCreate, LocationUpdate
 from app.security import get_password_hash
 
@@ -83,3 +86,45 @@ class LocationRepository:
         self.db.delete(db_location)
         self.db.commit()
         return True
+
+
+class SensorReadings:
+    """Telemetry storage on SQLAlchemy. Async API (DB work runs in a worker thread)."""
+
+    @staticmethod
+    def _save(device_id: str, t: dict) -> None:
+        ts = t["timestamp"]
+        if ts.tzinfo is not None:
+            ts = ts.astimezone(timezone.utc).replace(tzinfo=None)
+        with _db.SessionLocal() as session:
+            session.add(SensorReading(
+                device_id=device_id, timestamp=ts,
+                temperature=t["temperature"], humidity=t["humidity"],
+                gas=t["gas"], light=t["light"], sound=t["sound"],
+                units=t.get("units"),
+            ))
+            session.commit()
+
+    @staticmethod
+    def _find_latest(device_id: str) -> Optional[dict]:
+        with _db.SessionLocal() as session:
+            r = (session.query(SensorReading)
+                 .filter(SensorReading.device_id == device_id)
+                 .order_by(SensorReading.timestamp.desc(), SensorReading.id.desc())
+                 .first())
+            if not r:
+                return None
+            return {
+                "device_id": r.device_id, "timestamp": r.timestamp,
+                "temperature": r.temperature, "humidity": r.humidity,
+                "gas": r.gas, "light": r.light, "sound": r.sound,
+                "units": r.units or {},
+            }
+
+    @staticmethod
+    async def save(device_id: str, telemetry: dict) -> None:
+        await asyncio.to_thread(SensorReadings._save, device_id, telemetry)
+
+    @staticmethod
+    async def find_latest(device_id: str) -> Optional[dict]:
+        return await asyncio.to_thread(SensorReadings._find_latest, device_id)
