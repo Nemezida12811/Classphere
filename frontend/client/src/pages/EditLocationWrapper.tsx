@@ -1,4 +1,4 @@
-import { useParams} from 'react-router-dom';
+import { Navigate, useParams} from 'react-router-dom';
 import EditLocation from "./EditLocation.tsx";
 import type {User, Location} from "../components/types.tsx";
 import {useEffect, useState} from "react";
@@ -12,11 +12,11 @@ function EditLocationWrapper({ user, onLogout }: { user: User | null, onLogout: 
     useEffect(() => {
         const fetchLocation = async () => {
             const token = localStorage.getItem('token');
-            if (!locationId) return;
+            if (!user || !token || !locationId) return;
 
             try {
                 // Fetch real data from the backend
-                const data = await locationApi.get(locationId, token || "");
+                const data = await locationApi.get(locationId, token);
                 setLocation(data);
             } catch (err) {
                 console.error("Failed to load location for editing", err);
@@ -25,14 +25,16 @@ function EditLocationWrapper({ user, onLogout }: { user: User | null, onLogout: 
             }
         };
         fetchLocation();
-    }, [locationId]);
+    }, [locationId, user]);
 
+    if (!user || !localStorage.getItem('token')) return <Navigate to="/login" replace />;
+    if (!locationId) return <div>Location not found</div>;
     if (isLoading) return <div className="loading-screen">Loading...</div>;
     if (!location) return <div>Location not found</div>;
 
     return (
         <EditLocation
-            user={user!}
+            user={user}
             location={location}
             onLogout={onLogout}
         />

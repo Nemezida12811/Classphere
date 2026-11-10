@@ -3,11 +3,21 @@ import Footer from "../components/Footer";
 import BackButton from "../components/BackButton";
 import HeaderLogged from "../components/HeaderLogged.tsx";
 import FormAddRoom from "../components/FormAddRoom.tsx";
-import {useNavigate} from "react-router-dom";
+import {Navigate, useNavigate} from "react-router-dom";
+import type {Location, User} from "../components/types.tsx";
 import {locationApi} from "../newRestApiService.tsx";
 
-function AddRoom({ currentLocationId, availableLocations, user, onLogout }: any) {
+type AddRoomProps = {
+    currentLocationId?: string;
+    availableLocations: Location[];
+    user: User | null;
+    onLogout: () => void;
+};
+
+function AddRoom({ currentLocationId, availableLocations, user, onLogout }: AddRoomProps) {
     const navigate = useNavigate();
+
+    if (!user || !localStorage.getItem('token')) return <Navigate to="/login" replace />;
 
     const handleCreate = async (formData: any) => {
         const token = localStorage.getItem('token');
