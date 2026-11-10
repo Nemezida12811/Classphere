@@ -207,8 +207,11 @@ async function request<T>(url: string, method: 'GET' | 'POST' | 'PUT' | 'DELETE'
     });
 
     if (!res.ok) {
-        const error = await res.json();
-        throw new Error(error?.message || 'API Error');
+        const error = await res.json().catch(() => null);
+        const message = [error?.error, error?.message].find(
+            (value): value is string => typeof value === 'string' && value.trim().length > 0
+        );
+        throw new Error(message || `API Error (${res.status})`);
     }
 
     const json = await res.json();
