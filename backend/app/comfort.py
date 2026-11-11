@@ -1,12 +1,5 @@
-import json
-import logging
+"""Comfort index and rule-based recommendations (no external AI service needed)."""
 import math
-
-from .config import settings
-from .errors import iso
-from .repositories import SensorReadings
-
-log = logging.getLogger("comfort")
 
 # (field, ideal range, penalty threshold)
 _METRICS = [
@@ -17,44 +10,17 @@ _METRICS = [
     ("sound", (0, 50), 40),
 ]
 
-# Structured Outputs: model guaranteed to return JSON exactly of this form.
-# Root must be an object, so tips array is in "recommendations" field.
-_TIPS_SCHEMA = {
-    "name": "comfort_recommendations",
-    "strict": True,
-    "schema": {
-        "type": "object",
-        "properties": {
-            "recommendations": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "priority": {"type": "string", "enum": ["high", "medium", "low"]},
-                        "type": {"type": "string", "enum": [m[0] for m in _METRICS]},
-                        "message": {"type": "string"},
-                        "reason": {"type": "string"},
-                    },
-                    "required": ["priority", "type", "message", "reason"],
-                    "additionalProperties": False,
-                },
-            }
-        },
-        "required": ["recommendations"],
-        "additionalProperties": False,
-    },
+_TIPS = {
+    ("temperature", "low"): ("Increase the heating or close the windows.", "The room is colder than the comfortable 20–24 °C range."),
+    ("temperature", "high"): ("Cool the room: open a window or reduce heating.", "The room is warmer than the comfortable 20–24 °C range."),
+    ("humidity", "low"): ("Increase air humidity (humidifier, ventilate after rain).", "Air is drier than the comfortable 30–60 % range."),
+    ("humidity", "high"): ("Ventilate the room to reduce humidity.", "Air is more humid than the comfortable 30–60 % range."),
+    ("gas", "low"): ("Check the air quality sensor.", "Reading is below the normal indoor level (400 ppm)."),
+    ("gas", "high"): ("Ventilate the room: open windows or doors.", "CO₂ is above 1000 ppm, which reduces concentration."),
+    ("light", "low"): ("Turn on more lights or open the blinds.", "Illumination is below the recommended 300 lx."),
+    ("light", "high"): ("Reduce glare: use blinds or dim the lights.", "Illumination is above the recommended 1000 lx."),
+    ("sound", "high"): ("Reduce noise: close the door and ask for quiet.", "Noise is above the recommended 50 dB."),
 }
-
-_ai_client = None
-
-
-def _get_ai():
-    """Created lazily, so missing OPENAI_API_KEY does not break server startup."""
-    global _ai_client
-    if _ai_client is None:
-        from openai import AsyncOpenAI
-        _ai_client = AsyncOpenAI(api_key=settings.openai_api_key or None, timeout=30, max_retries=1)
-    return _ai_client
 
 
 def calculate_manual_comfort(latest: dict) -> int:
@@ -70,45 +36,21 @@ def calculate_manual_comfort(latest: dict) -> int:
     return math.floor(total / len(_METRICS) * 100 + 0.5)  # like Math.round
 
 
-async def calculate_comfort_by_audience(audience_id: str) -> dict | None:
-    latest = await SensorReadings.find_latest(audience_id)
-    if not latest:
-        return None
-    return {
-        "audienceId": audience_id,
-        "comfortPercentage": calculate_manual_comfort(latest),
-        "timestamp": iso(latest["timestamp"]),
-    }
-
-
-async def generate_tips(audience_id: str) -> list | None:
-    latest = await SensorReadings.find_latest(audience_id)
-    if not latest:
-        return None
-
-    u = latest.get("units") or {}
-    prompt = f"""You are an indoor comfort inspector. You have the following sensor data:
-Temperature: {latest['temperature']} {u.get('temperature', '')}
-Humidity: {latest['humidity']} {u.get('humidity', '')}
-Gas (Air Quality): {latest['gas']} {u.get('gas', '')}
-Light: {latest['light']} {u.get('light', '')}
-Sound (Noise): {latest['sound']} {u.get('sound', '')}
-
-Ideal ranges: Temperature (20-24), Humidity (30-60%), Gas (400-1000 ppm), Light (300-1000 lx), Sound (0-50 dB).
-
-Based on this data, give 2-3 specific recommendations to improve comfort.
-For each one provide: priority (high/medium/low), type (the sensor it concerns),
-message (the recommendation text) and reason (why this is important)."""
-    try:
-        response = await _get_ai().chat.completions.create(
-            model=settings.openai_model,
-            messages=[
-                {"role": "system", "content": "You are a concise indoor comfort assistant."},
-                {"role": "user", "content": prompt},
-            ],
-            response_format={"type": "json_schema", "json_schema": _TIPS_SCHEMA},
-        )
-        return json.loads(response.choices[0].message.content)["recommendations"]
-    except Exception:
-        log.exception("❌ [AI] Error generating tips")
-        return []
+def generate_tips(latest: dict) -> list[dict]:
+    """Rule-based tips for metrics outside their ideal range, most severe first."""
+    found = []
+    for field, (lo, hi), threshold in _METRICS:
+        val = latest[field]
+        if val < lo:
+            side, severity = "low", (lo - val) / threshold
+        elif val > hi:
+            side, severity = "high", (val - hi) / threshold
+        else:
+            continue
+        if (field, side) not in _TIPS:
+            continue
+        message, reason = _TIPS[(field, side)]
+        priority = "high" if severity >= 0.6 else "medium" if severity >= 0.25 else "low"
+        found.append((severity, {"priority": priority, "type": field, "message": message, "reason": reason}))
+    found.sort(key=lambda x: x[0], reverse=True)
+    return [{"id": i + 1, **tip} for i, (_, tip) in enumerate(found)]

@@ -23,3 +23,21 @@ class UnauthorizedException(HTTPException):
 class ForbiddenException(HTTPException):
     def __init__(self, detail: str = "Permission denied"):
         super().__init__(status_code=status.HTTP_403_FORBIDDEN, detail=detail)
+
+
+# ---- helpers for the frontend-facing API (/api/auth, /api/locations, /api/comfort) ----
+from datetime import datetime, timezone  # noqa: E402
+
+
+def iso(dt: datetime | None) -> str | None:
+    """ISO-8601 UTC string with 'Z'. Naive datetimes are treated as UTC."""
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def ok(data):
+    """Envelope expected by frontend/client/src/newRestApiService.tsx (it reads `json.data`)."""
+    return {"success": True, "data": data}

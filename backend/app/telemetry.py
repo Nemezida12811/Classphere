@@ -1,4 +1,5 @@
-"""MQTT telemetry processing (analog of mqtt.service.js + mqtt.topics.js)."""
+"""Telemetry processing: parse -> validate -> convert raw ADC values -> store.
+Fed by MQTT (real devices) or by app.simulator (no hardware)."""
 import json
 import logging
 import math
@@ -6,6 +7,7 @@ import re
 import time
 from datetime import datetime, timezone
 
+from .db import SessionLocal
 from .repositories import SensorReadings
 
 log = logging.getLogger("mqtt")
@@ -94,7 +96,7 @@ def convert_units(t: dict) -> dict:
     return t
 
 
-async def handle_message(topic: str, raw: bytes) -> None:
+async def handle_message(topic: str, raw: bytes, session_factory=SessionLocal) -> None:
     try:
         payload = json.loads(raw.decode())
     except Exception as exc:
@@ -116,7 +118,8 @@ async def handle_message(topic: str, raw: bytes) -> None:
     telemetry = convert_units(telemetry)
     telemetry["timestamp"] = datetime.fromtimestamp(telemetry["timestamp_ms"] / 1000, tz=timezone.utc)
     try:
-        await SensorReadings.save(device_id, telemetry)
+        with session_factory() as db:
+            SensorReadings.save(db, device_id, telemetry)
         log.info("✅ Saved telemetry for %s", device_id)
     except Exception:
         log.exception("❌ Failed to save telemetry for %s", device_id)

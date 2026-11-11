@@ -83,3 +83,65 @@ class LocationRepository:
         self.db.delete(db_location)
         self.db.commit()
         return True
+
+
+# ==================== SENSOR READINGS / DEVICES ====================
+from datetime import timezone  # noqa: E402
+from app.db import Device, SensorReading  # noqa: E402
+
+UNIT_DEFAULTS = {"temperature": "°C", "humidity": "%", "gas": "ppm", "light": "lx", "sound": "dB"}
+
+
+class SensorReadings:
+    """Telemetry storage. All methods take an explicit Session (works for requests, MQTT and the simulator)."""
+
+    @staticmethod
+    def save(db: Session, device_id: str, t: dict) -> None:
+        ts = t["timestamp"]
+        if ts.tzinfo is not None:
+            ts = ts.astimezone(timezone.utc).replace(tzinfo=None)
+        db.add(SensorReading(
+            device_id=device_id,
+            temperature=t["temperature"], humidity=t["humidity"], gas=t["gas"],
+            light=t["light"], sound=t["sound"],
+            units=t.get("units"), timestamp=ts,
+        ))
+        db.commit()
+
+    @staticmethod
+    def exists(db: Session, device_id: str) -> bool:
+        return db.query(SensorReading.id).filter(SensorReading.device_id == device_id).first() is not None
+
+    @staticmethod
+    def find_latest(db: Session, device_id: str) -> Optional[dict]:
+        row = (
+            db.query(SensorReading)
+            .filter(SensorReading.device_id == device_id)
+            .order_by(SensorReading.timestamp.desc(), SensorReading.id.desc())
+            .first()
+        )
+        if not row:
+            return None
+        device = db.query(Device).filter(Device.id == device_id).first()
+        units = {**UNIT_DEFAULTS, **{k: v for k, v in (row.units or {}).items() if v}}
+        return {
+            "temperature": row.temperature, "humidity": row.humidity, "gas": row.gas,
+            "light": row.light, "sound": row.sound, "units": units, "timestamp": row.timestamp,
+            "name": (device.name if device else None) or "",
+            "hidden": bool(device.hidden) if device else False,
+        }
+
+    @staticmethod
+    def prune(db: Session, device_id: str, keep: int = 500) -> None:
+        """Keep only the newest `keep` readings of the device (the simulator writes continuously)."""
+        ids = (
+            db.query(SensorReading.id)
+            .filter(SensorReading.device_id == device_id)
+            .order_by(SensorReading.id.desc())
+            .offset(keep).limit(1).first()
+        )
+        if ids:
+            db.query(SensorReading).filter(
+                SensorReading.device_id == device_id, SensorReading.id <= ids[0]
+            ).delete(synchronize_session=False)
+            db.commit()
