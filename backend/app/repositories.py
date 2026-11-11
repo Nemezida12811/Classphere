@@ -1,6 +1,9 @@
+import asyncio
+from datetime import timezone
 from typing import List, Optional
 from sqlalchemy.orm import Session
-from app.db import User, Location
+from app import db as _db
+from app.db import User, Location, SensorReading
 from app.schemas import UserCreate, LocationCreate, LocationUpdate
 from app.security import get_password_hash
 
