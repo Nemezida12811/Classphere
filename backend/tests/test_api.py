@@ -156,7 +156,7 @@ def test_telemetry_helpers():
 def test_timestamp_formats():
     assert parse_timestamp(1765978387) == 1765978387000          # epoch, seconds
     assert parse_timestamp("1765978387") == 1765978387000
-    assert parse_timestamp("2025-12-17T13:33:07Z") == 1765978387000   # ISO - firmware format
+    assert parse_timestamp("2025-12-17T13:33:07Z") == 1765978387000   # ISO — firmware format
     assert parse_timestamp(1765978387000) == 1765978387000       # milliseconds
     assert abs(parse_timestamp(None) - time.time() * 1000) < 2000
     assert abs(parse_timestamp("garbage") - time.time() * 1000) < 2000
